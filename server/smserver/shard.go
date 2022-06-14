@@ -21,6 +21,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -406,8 +407,13 @@ func (ss *smShard) balanceChecker(ctx context.Context) error {
 		if len(etcdHbContainerIdAndAny) == 0 {
 			continue
 		}
+		// 获取该service下container对应的资源组
+		containerIdAndWorkerGroups, err := ss.getContainerIdAndWorkerGroups()
+		if err != nil {
+			return err
+		}
 
-		shardMoves := ss.extractShardMoves(bg.fixShardIdAndManualContainerId, etcdHbContainerIdAndAny, bg.hbShardIdAndContainerId, shardIdAndShardSpec)
+		shardMoves := ss.extractShardMoves(bg.fixShardIdAndManualContainerId, etcdHbContainerIdAndAny, bg.hbShardIdAndContainerId, shardIdAndShardSpec, containerIdAndWorkerGroups)
 		if len(shardMoves) > 0 {
 			allShardMoves = append(allShardMoves, shardMoves...)
 			continue
@@ -659,7 +665,8 @@ func (ss *smShard) extractShardMoves(
 	fixShardIdAndManualContainerId ArmorMap,
 	hbContainerIdAndAny ArmorMap,
 	hbShardIdAndContainerId ArmorMap,
-	shardIdAndShardSpec map[string]*apputil.ShardSpec) moveActionList {
+	shardIdAndShardSpec map[string]*apputil.ShardSpec,
+	containerIdAndWorkerGroups map[string]map[string]struct{}) moveActionList {
 	// 保证shard在hb中上报的container和存活container一致
 	containerIdAndHbShardIds := hbShardIdAndContainerId.SwapKV()
 	for containerId := range containerIdAndHbShardIds {
@@ -677,20 +684,59 @@ func (ss *smShard) extractShardMoves(
 		mals moveActionList
 
 		// 在最后做shard分配的时候合并到大集合中
-		adding []string
+		adding = make(map[string]struct{})
 
 		br = &balancer{
-			bcs: make(map[string]*balancerContainer),
+			bcs:                        make(map[string]*balancerContainer),
+			containerIdAndWorkerGroups: containerIdAndWorkerGroups,
 		}
 	)
 
+	// 构建资源组 workerGroup => none
+	bwgs := make(map[string]*balancerWorkerGroup)
+	// 将空workerGroup也加入计算
+	bwgs[""] = &balancerWorkerGroup{containerCnt: len(hbContainerIdAndAny)}
+
+	// 计算每个workerGroup有多少container
+	for cid := range hbContainerIdAndAny {
+		if groups, ok := containerIdAndWorkerGroups[cid]; ok {
+			for group := range groups {
+				if bwgs[group] == nil {
+					bwgs[group] = &balancerWorkerGroup{}
+				}
+				bwgs[group].containerCnt++
+			}
+		}
+	}
+
+	// 计算每个workerGroup有多少shards
+	for _, shardId := range fixShardIdAndManualContainerId.KeyList() {
+		if bwg, ok := bwgs[shardIdAndShardSpec[shardId].WorkerGroup]; ok {
+			bwg.shardCnt++
+		} else {
+			// shard指定的资源组不存在
+			ss.lg.Warn(
+				"shard workerGroup not exist",
+				zap.String("service", ss.service),
+				zap.String("shardId", shardId),
+				zap.String("workerGroup", shardIdAndShardSpec[shardId].WorkerGroup),
+			)
+		}
+	}
+
+	// 计算每个分组container最多可以包含多少个shard
+	for _, bwg := range bwgs {
+		bwg.maxHold = ss.maxHold(bwg.containerCnt, bwg.shardCnt)
+	}
+	dropFroms := make(map[string]string)
+
 	// 构建container和shard的关系
 	for fixShardId, manualContainerId := range fixShardIdAndManualContainerId {
+		spec := shardIdAndShardSpec[fixShardId]
 		// 不在container上，可能是新增，确定需要被分配
 		currentContainerId, ok := hbShardIdAndContainerId[fixShardId]
 		if !ok {
 			if manualContainerId != "" {
-				spec := shardIdAndShardSpec[fixShardId]
 				mals = append(
 					mals,
 					&moveAction{
@@ -702,9 +748,20 @@ func (ss *smShard) extractShardMoves(
 				)
 
 				// 确定的指令，要对当前的csm有影响
-				br.put(manualContainerId, fixShardId, true)
+				br.put(manualContainerId, fixShardId, "", true)
 			} else {
-				adding = append(adding, fixShardId)
+				// shard的资源组存在才可以加入
+				if _, ok := bwgs[spec.WorkerGroup]; ok {
+					adding[fixShardId] = struct{}{}
+				} else {
+					// shard指定的资源组不存在
+					ss.lg.Warn(
+						"shard workerGroup not exist",
+						zap.String("service", ss.service),
+						zap.String("shardId", fixShardId),
+						zap.String("workerGroup", spec.WorkerGroup),
+					)
+				}
 			}
 			continue
 		}
@@ -712,7 +769,6 @@ func (ss *smShard) extractShardMoves(
 		// 不在要求的container上
 		if manualContainerId != "" {
 			if currentContainerId != manualContainerId {
-				spec := shardIdAndShardSpec[fixShardId]
 				mals = append(
 					mals,
 					&moveAction{
@@ -725,15 +781,38 @@ func (ss *smShard) extractShardMoves(
 				)
 
 				// 确定的指令，要对当前的csm有影响
-				br.put(manualContainerId, fixShardId, true)
+				br.put(manualContainerId, fixShardId, "", true)
 			} else {
 				// 命中manual是不能被移动的
-				br.put(currentContainerId, fixShardId, true)
+				br.put(currentContainerId, fixShardId, "", true)
 			}
 			continue
 		}
-
-		br.put(currentContainerId, fixShardId, false)
+		// shard的资源组不存在，需要drop
+		if _, ok := bwgs[spec.WorkerGroup]; !ok {
+			mals = append(
+				mals,
+				&moveAction{
+					Service:      ss.service,
+					ShardId:      fixShardId,
+					DropEndpoint: currentContainerId,
+					Spec:         spec,
+				},
+			)
+		} else {
+			// WorkerGroup中存在ContainerId才会加入
+			exist := false
+			if _, ok := containerIdAndWorkerGroups[currentContainerId]; ok {
+				if _, ok := containerIdAndWorkerGroups[currentContainerId][spec.WorkerGroup]; ok {
+					exist = true
+					br.put(currentContainerId, fixShardId, spec.WorkerGroup, false)
+				}
+			}
+			// shard的资源组中不包含shard当前的container
+			if !exist {
+				dropFroms[fixShardId] = currentContainerId
+			}
+		}
 	}
 
 	// 处理新增container
@@ -744,29 +823,28 @@ func (ss *smShard) extractShardMoves(
 		}
 	}
 
-	shardLen := len(fixShardIdAndManualContainerId)
-	containerLen := len(hbContainerIdAndAny)
-
-	// 每个container最少包含多少shard
-	maxHold := ss.maxHold(containerLen, shardLen)
-
-	dropFroms := make(map[string]string)
 	getDrops := func(bc *balancerContainer) {
-		dropCnt := len(bc.shards) - maxHold
-		if dropCnt <= 0 {
-			return
-		}
-
-		for _, bs := range bc.shards {
-			// 不能变动的shard
-			if bs.isManual {
+		for wg, mshards := range bc.shards {
+			bwg := bwgs[wg]
+			if bwg == nil {
+				// shard指定的资源组不存在
 				continue
 			}
-			dropFroms[bs.id] = bc.id
-			delete(bc.shards, bs.id)
-			dropCnt--
-			if dropCnt == 0 {
-				break
+			dropCnt := len(mshards) - bwg.maxHold
+			if dropCnt <= 0 {
+				continue
+			}
+			for _, bs := range mshards {
+				// 不能变动的shard
+				if bs.isManual {
+					continue
+				}
+				dropFroms[bs.id] = bc.id
+				delete(mshards, bs.id)
+				dropCnt--
+				if dropCnt == 0 {
+					break
+				}
 			}
 		}
 	}
@@ -774,49 +852,49 @@ func (ss *smShard) extractShardMoves(
 
 	// 可以移动的shard，补充到待分配中
 	for drop := range dropFroms {
-		adding = append(adding, drop)
+		adding[drop] = struct{}{}
 	}
+
 	if len(adding) > 0 {
 		add := func(bc *balancerContainer) {
-			addCnt := maxHold - len(bc.shards)
-			if addCnt <= 0 {
-				return
-			}
-
-			idx := 0
-			for {
-				if idx == addCnt || idx == len(adding) {
-					break
-				}
-
-				shardId := adding[idx]
+			for shardId := range adding {
 				spec := shardIdAndShardSpec[shardId]
+				// container不属于shard的资源组
+				if !bc.ContainsWorkerGroup(spec.WorkerGroup) {
+					continue
+				}
+				// container中该shard所在资源组的shard数量超过允许分配的最大值
+				if bwgs[spec.WorkerGroup].maxHold-len(bc.shards[spec.WorkerGroup]) <= 0 {
+					continue
+				}
+				br.put(bc.id, shardId, spec.WorkerGroup, false)
 				from, ok := dropFroms[shardId]
 				if ok {
-					mals = append(
-						mals,
-						&moveAction{
-							Service:      ss.service,
-							ShardId:      adding[idx],
-							DropEndpoint: from,
-							AddEndpoint:  bc.id,
-							Spec:         spec,
-						},
-					)
+					if from != bc.id {
+						mals = append(
+							mals,
+							&moveAction{
+								Service:      ss.service,
+								ShardId:      shardId,
+								DropEndpoint: from,
+								AddEndpoint:  bc.id,
+								Spec:         spec,
+							},
+						)
+					}
 				} else {
 					mals = append(
 						mals,
 						&moveAction{
 							Service:     ss.service,
-							ShardId:     adding[idx],
+							ShardId:     shardId,
 							AddEndpoint: bc.id,
 							Spec:        spec,
 						},
 					)
 				}
-				idx++
+				delete(adding, shardId)
 			}
-			adding = adding[idx:]
 		}
 		br.forEach(add)
 	}
@@ -857,4 +935,32 @@ func (ss *smShard) dispatchMALs(mal moveActionList) error {
 		return nil
 	}
 	return ss.operator.move(mal)
+}
+
+func (ss *smShard) getContainerIdAndWorkerGroups() (map[string]map[string]struct{}, error) {
+	cwg := make(map[string]map[string]struct{})
+	pfx := ss.container.nodeManager.nodeServiceWorkerGroup(ss.service)
+	resp, err := ss.container.Client.Get(context.TODO(), pfx, clientv3.WithPrefix())
+	if err != nil {
+		ss.lg.Error(
+			"GetKVs error",
+			zap.String("service", ss.service),
+			zap.String("pfx", pfx),
+			zap.Error(err),
+		)
+		return nil, errors.Wrap(err, "")
+	}
+	for _, kv := range resp.Kvs {
+		// /sm/app/foo.bar/service/foo.bar/workerpool/g1/127.0.0.1:8801
+		arr := strings.Split(string(kv.Key), "/")
+		if len(arr)-2 > 0 {
+			if _, ok := cwg[arr[len(arr)-1]]; ok {
+				cwg[arr[len(arr)-1]][arr[len(arr)-2]] = struct{}{}
+				continue
+			}
+			cwg[arr[len(arr)-1]] = make(map[string]struct{})
+			cwg[arr[len(arr)-1]][arr[len(arr)-2]] = struct{}{}
+		}
+	}
+	return cwg, nil
 }

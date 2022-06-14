@@ -42,6 +42,22 @@ definitions:
         description: Service 目前app的spec更多承担的是管理职能，shard配置的一个起点，先只配置上service，可以唯一标记一个app
         type: string
     type: object
+  smserver.workerRequest:
+    properties:
+      service:
+        description: 为哪个业务app增加worker
+        type: string
+      worker:
+        description: 需要添加的资源，添加后，shard中如果存在WorkerGroup，只会将shard分配到该WorkerGroup下的worker中。
+        type: string
+      workerGroup:
+        description: 在哪个资源组下面添加worker
+        type: string
+    required:
+    - service
+    - worker
+    - workerGroup
+    type: object
 info:
   contact: {}
 paths:
@@ -83,6 +99,25 @@ paths:
           description: ""
       tags:
       - spec
+  /sm/server/add-worker:
+    post:
+      consumes:
+      - application/json
+      description: add service worker
+      parameters:
+      - description: param
+        in: body
+        name: param
+        required: true
+        schema:
+          $ref: '#/definitions/smserver.workerRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: ""
+      tags:
+      - worker
   /sm/server/del-shard:
     post:
       consumes:
@@ -120,6 +155,25 @@ paths:
           description: ""
       tags:
       - spec
+  /sm/server/del-worker:
+    post:
+      consumes:
+      - application/json
+      description: del service worker
+      parameters:
+      - description: param
+        in: body
+        name: param
+        required: true
+        schema:
+          $ref: '#/definitions/smserver.workerRequest'
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: ""
+      tags:
+      - worker
   /sm/server/get-shard:
     get:
       consumes:
@@ -150,4 +204,22 @@ paths:
           description: ""
       tags:
       - spec
+  /sm/server/get-worker:
+    get:
+      consumes:
+      - application/json
+      description: get service workerpool all worker
+      parameters:
+      - description: param
+        in: query
+        name: service
+        required: true
+        type: string
+      produces:
+      - application/json
+      responses:
+        "200":
+          description: ""
+      tags:
+      - worker
 swagger: "2.0"
